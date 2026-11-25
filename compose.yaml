@@ -1,0 +1,24 @@
+name: parking
+
+services:
+  floci:
+    image: floci/floci:2.5.0
+    container_name: parking-floci
+    ports:
+      - "127.0.0.1:4566:4566"
+    environment:
+      FLOCI_STORAGE_MODE: persistent
+      FLOCI_STORAGE_PERSISTENT_PATH: /app/data
+      FLOCI_HOSTNAME: floci
+      FLOCI_BASE_URL: http://floci:4566
+      FLOCI_SERVICES_DOCKER_NETWORK: parking_default
+    volumes:
+      - parking-data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+
+networks:
+  default:
+    name: parking_default
+
+volumes:
+  parking-data:
