@@ -1,17 +1,21 @@
-
 const express = require("express");
-
+const c = require("../controllers/requestController");
+const auth = require("../middleware/auth");
 const router = express.Router();
-
-// GET /api/allocation/requests
-router.get("/", (req, res) => {
-  res.status(401).json({
-    success: false,
-    error: {
-      code: "UNAUTHORIZED",
-      message: "Authentication is required"
-    }
-  });
-});
-
+router.get("/internal/reservations/:id/validity", auth.internal, c.validity);
+if (process.env.ACCOUNTS_FILE || process.env.ACCOUNTS_JSON)
+  router.post("/auth/login", auth.login);
+router.use(auth.user);
+router.post("/requests", c.create);
+router.get("/requests", c.list);
+router.get("/requests/:id", c.read);
+router.patch("/requests/:id", c.edit);
+router.post("/requests/:id/cancel", c.cancel);
+router.post("/requests/:id/assign", auth.admin, c.assign);
+router.get("/reservations/:id", c.reservation);
+router.patch("/reservations/:id/cancel", c.cancelReservation);
+router.post("/reservations/:id/renew", c.renew);
+router.get("/waitlist/me", c.waitlist);
+router.post("/pricing/quote", c.quote);
+router.post("/admin/maintenance", auth.admin, c.maintain);
 module.exports = router;

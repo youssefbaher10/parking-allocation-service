@@ -4,8 +4,15 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node index.js"
+    "test": "node --test test/rules.test.js",
+    "start": "node index.js",
+    "test:api": "node --test test/api.test.js",
+    "setup": "node scripts/setup.js",
+    "demo": "node scripts/demo.js",
+    "sweep": "node scripts/sweep.js",
+    "walkthrough": "node scripts/walkthrough.js",
+    "cloud:ecs": "node infra/deploy.js",
+    "cloud:schedule": "node infra/maintenance.js"
   },
   "repository": {
     "type": "git",
@@ -22,7 +29,18 @@
   "dependencies": {
     "@aws-sdk/client-dynamodb": "^3.1176.0",
     "@aws-sdk/lib-dynamodb": "^3.1176.0",
+    "cors": "^2.8.6",
     "dotenv": "^18.0.10",
-    "express": "^5.3.0"
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.5",
+    "helmet": "^8.3.0",
+    "jsonwebtoken": "^9.0.3"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "adm-zip": "^0.6.1",
+    "esbuild": "^0.28.2"
   }
 }

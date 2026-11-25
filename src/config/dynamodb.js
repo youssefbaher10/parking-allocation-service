@@ -1,5 +1,4 @@
-
-require("dotenv").config();
+require("dotenv").config({ quiet: true });
 
 const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
 const { DynamoDBDocumentClient } = require("@aws-sdk/lib-dynamodb");
@@ -7,7 +6,7 @@ const { DynamoDBDocumentClient } = require("@aws-sdk/lib-dynamodb");
 // Configure the connection to DynamoDB
 const client = new DynamoDBClient({
   region: process.env.AWS_REGION,
-  endpoint: process.env.DYNAMODB_ENDPOINT
+  endpoint: process.env.DYNAMODB_ENDPOINT,
 });
 
 // Make it easier to read and write JavaScript objects
