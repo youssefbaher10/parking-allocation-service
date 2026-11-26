@@ -549,6 +549,160 @@ test("reservation lookup reports conflicting active records as an error", async 
   assert.equal(result.data, undefined);
 });
 
+// QR tests mock only the external provider; Cognito, HTTP routes and
+// DynamoDB still run against the isolated local integration environment.
+const mockPng = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1sAAAAASUVORK5CYII=",
+  "base64",
+);
+
+function mockQrProvider(t, reply = () => new Response(mockPng, {
+  status: 200,
+  headers: { "Content-Type": "image/png" },
+})) {
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  t.mock.method(globalThis, "fetch", async (input, options) => {
+    const url = new URL(input instanceof Request ? input.url : input);
+    if (url.origin === "https://api.qrserver.com") {
+      calls.push({ url, options });
+      return reply(url, options);
+    }
+    if (!["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+      throw new Error("Unexpected non-local fetch during QR test.");
+    }
+    return originalFetch(input, options);
+  });
+  return calls;
+}
+
+async function createQrReservation(n) {
+  const result = await api("POST", "/requests", one, {
+    ...slot(n),
+    vehicle_plate: "QRTEST123",
+  });
+  assert.equal(result.status, 201);
+  assert.equal(result.data.status, "allocated");
+  return result.data.reservation_id;
+}
+
+function qrPath(id) {
+  return "/reservations/" + encodeURIComponent(id) + "/qr";
+}
+
+async function assertQrImage(id, token) {
+  const response = await fetch(base + qrPath(id), {
+    headers: { Authorization: "Bearer " + token },
+  });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("content-type"), "image/png");
+  assert.equal(response.headers.get("cache-control"), "no-store");
+  assert.deepEqual(Buffer.from(await response.arrayBuffer()), mockPng);
+}
+
+test("QR permit returns PNG for owner and admin and supports future and active reservations", async (t) => {
+  const calls = mockQrProvider(t);
+  const id = await createQrReservation(11);
+  await assertQrImage(id, one);
+  await assertQrImage(id, admin);
+
+  const reservation = (await api("GET", "/reservations/" + id, one)).data;
+  const active = await seedLookupReservation({
+    ...reservation,
+    reservation_id: "res_qr_active_" + randomUUID(),
+    spot_id: "QR-ACTIVE",
+    start_time: new Date(Date.now() - 60000).toISOString(),
+    end_time: new Date(Date.now() + 3600000).toISOString(),
+  });
+  await assertQrImage(active.reservation_id, one);
+
+  assert.equal(calls.length, 3);
+  for (const [i, call] of calls.entries()) {
+    assert.equal(call.url.pathname, "/v1/create-qr-code/");
+    assert.deepEqual(Object.fromEntries(call.url.searchParams), {
+      data: i === 2 ? active.reservation_id : id,
+      size: "250x250",
+      format: "png",
+      qzone: "4",
+    });
+    assert.equal(call.options.method, "GET");
+    assert.equal(call.options.redirect, "error");
+    assert.equal(new Headers(call.options.headers).has("Authorization"), false);
+  }
+});
+
+test("QR permit denies unauthenticated users, other owners and missing reservations before contacting provider", async (t) => {
+  const calls = mockQrProvider(t);
+  const id = await createQrReservation(12);
+  for (const [path, token, status] of [
+    [qrPath(id), undefined, 401],
+    [qrPath(id), two, 404],
+    [qrPath(id), process.env.INTERNAL_TOKEN, 401],
+    [qrPath("res_missing_" + randomUUID()), one, 404],
+  ]) {
+    const result = await api("GET", path, token);
+    assert.equal(result.status, status);
+    assert.equal(result.success, false);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test("QR permit rejects cancelled, expired and ended reservations before contacting provider", async (t) => {
+  const calls = mockQrProvider(t);
+  const id = await createQrReservation(13);
+  const reservation = (await api("GET", "/reservations/" + id, one)).data;
+  const cancelled = await api("PATCH", "/reservations/" + id + "/cancel", one);
+  assert.equal(cancelled.status, 200);
+  assert.equal(cancelled.data.status, "cancelled");
+  assert.equal((await api("GET", qrPath(id), one)).status, 409);
+
+  for (const status of ["expired", "confirmed"]) {
+    const ended = await seedLookupReservation({
+      ...reservation,
+      reservation_id: "res_qr_ended_" + randomUUID(),
+      status,
+      spot_id: "QR-ENDED",
+      start_time: new Date(Date.now() - 7200000).toISOString(),
+      end_time: new Date(Date.now() - 3600000).toISOString(),
+    });
+    const result = await api("GET", qrPath(ended.reservation_id), one);
+    assert.equal(result.status, 409);
+    assert.equal(result.success, false);
+  }
+  assert.equal(calls.length, 0);
+});
+
+test("QR provider failures return 503 without changing the reservation", async (t) => {
+  const replies = [
+    () => { throw new TypeError("Simulated connection failure"); },
+    () => { throw new DOMException("Simulated timeout", "TimeoutError"); },
+    () => new Response("unavailable", { status: 503 }),
+    () => new Response("not an image", {
+      headers: { "Content-Type": "text/plain" },
+    }),
+    () => new Response("invalid PNG", {
+      headers: { "Content-Type": "image/png" },
+    }),
+    () => new Response(Buffer.alloc(1024 * 1024 + 1), {
+      headers: { "Content-Type": "image/png" },
+    }),
+  ];
+  const calls = mockQrProvider(t, () => replies[calls.length - 1]());
+  const id = await createQrReservation(14);
+  const beforeFailure = await api("GET", "/reservations/" + id, one);
+  assert.equal(beforeFailure.status, 200);
+  for (let i = 0; i < replies.length; i++) {
+    const result = await api("GET", qrPath(id), one);
+    assert.equal(result.status, 503);
+    assert.equal(result.success, false);
+    assert.equal(result.error.code, "QR_UNAVAILABLE");
+  }
+  assert.equal(calls.length, replies.length);
+  const afterFailure = await api("GET", "/reservations/" + id, one);
+  assert.equal(afterFailure.status, 200);
+  assert.deepEqual(afterFailure.data, beforeFailure.data);
+});
+
 test("security headers and rate limit", async () => {
   const res = await fetch(base + "/requests", {
     headers: { Authorization: "Bearer " + one },

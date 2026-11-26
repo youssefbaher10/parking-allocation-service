@@ -69,11 +69,22 @@ module.exports = {
     send(res, await service.price(req.body));
   },
 
+  // Generate and return a QR parking permit as a PNG image.
+  async qrPermit(req, res) {
+    const image = await service.qrPermit(
+      req.params.id,
+      req.actor,
+    );
+
+    res.set("Cache-Control", "no-store");
+    res.type("png");
+    res.status(200).send(image);
+  },
+
   async validity(req, res) {
     send(res, await service.validity(req.params.id));
   },
 
-  // Lookup an active reservation by vehicle plate and parking spot.
   async lookupReservation(req, res) {
     send(res, await service.lookupReservation(req.query));
   },

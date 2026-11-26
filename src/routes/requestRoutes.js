@@ -40,6 +40,9 @@ router.get("/reservations/:id", c.reservation);
 router.patch("/reservations/:id/cancel", c.cancelReservation);
 router.post("/reservations/:id/renew", c.renew);
 
+// External QR parking permit generation
+router.get("/reservations/:id/qr", c.qrPermit);
+
 // Waitlist
 router.get("/waitlist/me", c.waitlist);
 

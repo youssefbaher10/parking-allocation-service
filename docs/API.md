@@ -1,4 +1,3 @@
-
 # API and Integration Agreement
 
 ## Base URL
@@ -29,11 +28,14 @@ Internal reservation verification endpoints require:
 
 `Authorization: Bearer <INTERNAL_TOKEN>`
 
-Successful response:
+Successful JSON response (except QR image generation):
 
 ```json
 {"success":true,"data":{}}
 ```
+
+The QR generation endpoint returns a binary PNG image on success.
+Errors from this endpoint use the same JSON error format as other endpoints.
 
 Error response:
 
@@ -53,6 +55,7 @@ Error response:
 | POST /requests/:id/cancel | Cancel a waiting or allocated request. The associated reservation is closed in the same transaction. |
 | POST /requests/:id/assign | Admin only. Send a spot_id to assign a matching available parking spot. |
 | GET /reservations/:id | Owner or administrator retrieves reservation details. |
+| GET /reservations/:id/qr | Owner or administrator generates a PNG parking permit through the external goQR.me API for a confirmed, unexpired reservation. |
 | PATCH /reservations/:id/cancel | Owner or administrator cancels a reservation and its associated request. |
 | POST /reservations/:id/renew | Extend a reservation using a later end_time. Returns 409 if the extension conflicts with another booking. |
 | GET /waitlist/me | Returns the user's waiting requests and their queue positions. |
@@ -152,6 +155,22 @@ active to return valid:true.
 A future reservation returns valid:false even when
 the vehicle plate and spot ID match.
 
+### 6. Generate a QR parking permit
+
+GET:
+
+`http://localhost:3001/api/allocation/reservations/res_123/qr`
+
+Replace res_123 with the reservation ID from an allocated request.
+In Postman, select Bearer Token authentication and provide the
+owner's Cognito access token (or an administrator's access token).
+A successful response is a PNG image, which can be previewed or
+saved from Postman. Scan the image to confirm it contains the
+reservation ID only.
+
+A confirmed future reservation can generate a QR permit, but it
+will not pass internal validity verification before its start time.
+
 ## Request and Reservation States
 
 Request states:
@@ -186,6 +205,144 @@ price uses availability at confirmation.
 | 429 | Rate limit exceeded |
 | 500 | Unexpected application or database error |
 | 503 | Unavailable dependency, unresolved write contention or conflicting active reservation records |
+
+## External API Integration — QR Parking Permits
+
+### Purpose and workflow
+
+The Allocation Service uses the goQR.me QR Code API to generate
+parking permit images for authorized reservations.
+
+Endpoint:
+
+`GET /api/allocation/reservations/:id/qr`
+
+1. The backend verifies the Cognito access token.
+2. The backend retrieves the reservation and checks that the caller
+   is its owner or an administrator.
+3. The reservation must be confirmed and its end time must not have
+   been reached. Confirmed future reservations are allowed.
+4. The backend sends an HTTPS request to the external QR provider.
+5. The backend validates the response and returns the PNG image.
+
+The provider request uses a fixed HTTPS URL:
+
+`https://api.qrserver.com/v1/create-qr-code/`
+
+Query parameters:
+
+| Parameter | Value |
+|---|---|
+| data | Reservation ID only |
+| size | 250x250 |
+| format | png |
+| qzone | 4 |
+
+The provider integration is implemented in `src/services/qrProvider.js`.
+Reservation authorization and state checks are performed in
+`src/services/requestService.js` before calling the external provider.
+
+### Authentication and response
+
+```http
+GET /api/allocation/reservations/res_123/qr
+Authorization: Bearer <Cognito-Access-Token>
+```
+
+Successful response:
+
+```http
+HTTP/1.1 200 OK
+Content-Type: image/png
+Cache-Control: no-store
+```
+
+The body contains the binary PNG image, not the usual JSON envelope.
+Error responses remain JSON.
+
+| Code | Meaning |
+|---|---|
+| 200 | QR image generated successfully |
+| 401 | Missing or invalid Cognito access token, including use of an internal service token instead |
+| 404 | Reservation missing or owned by another user (unless the caller is an administrator) |
+| 409 | Reservation is not confirmed or its end time has been reached |
+| 429 | Existing API rate limit exceeded |
+| 500 | Unexpected application or database error |
+| 503 | External QR provider unavailable or returned an unacceptable response |
+
+Provider failures use the error code `QR_UNAVAILABLE`.
+
+### Security and limitations
+
+- The external request is made by the backend, not the frontend.
+- No external API key is required for this integration.
+- Only the reservation ID and QR formatting parameters are sent to
+  the provider. Names, vehicle plates, Cognito credentials, access
+  tokens and internal service tokens are not sent.
+- The provider receives the reservation identifier, which is a
+  third-party data disclosure even though it is not a vehicle plate
+  or credential. Provider retention and privacy practices have not
+  been independently assessed for production use.
+- The backend uses HTTPS, a five-second timeout and rejects redirects.
+- The backend checks the provider's HTTP status, PNG content type,
+  image signature and maximum response size of 1 MiB.
+  These checks are not a full image decoder.
+- Successful responses use `Cache-Control: no-store` to instruct
+  HTTP caches not to store the permit response.
+- Generating a QR code does not modify reservation records.
+- External provider failures return 503 without cancelling or
+  changing the existing reservation.
+- The image is not proof of authorization by itself. It contains a
+  reservation reference, not a signed or tamper-proof permit.
+  The Incident Service must verify the current reservation status,
+  time window, vehicle plate and parking spot using its internal API.
+- A previously generated QR image can still be scanned after
+  cancellation or expiry, but the reservation will fail current
+  validity verification.
+- QR generation depends on external network access and provider
+  availability. There is no offline generation fallback in this
+  implementation.
+
+### Individual testing
+
+The live test uses `scripts/qr-walkthrough.js` through the local
+routing proxy on port 8080 with Cognito, sample Inventory and
+DynamoDB through Floci.
+
+Run after starting the workers and securely loading the existing
+`DEMO_USER1_PASSWORD` environment variable:
+
+```bash
+node scripts/qr-walkthrough.js
+```
+
+The live test successfully authenticated a fictional user, allocated
+a dummy reservation, received HTTP 200 and an image/png response,
+verified the PNG signature and no-store header, and saved the
+521-byte image to `.local/runtime/qr-permit.png` in the recorded run.
+The image was scanned and its reservation ID confirmed. The dummy
+reservation was cancelled after generation.
+
+Four automated QR API test groups cover:
+
+- Owner and administrator access; future and active confirmed bookings;
+  response headers, PNG bytes and outbound request parameters.
+- Missing authentication, other owners, internal token rejection and
+  missing reservations; no outbound QR call for rejected requests.
+- Cancelled, expired and ended reservations; no outbound QR call for
+  rejected requests.
+- Simulated connection failure, timeout, non-success HTTP status,
+  wrong content type, invalid PNG signature and oversized response;
+  503 QR_UNAVAILABLE and unchanged reservation data.
+
+These automated tests mock the external QR provider while using
+local Cognito, HTTP endpoints and temporary DynamoDB tables through
+Floci. The live test separately exercised the actual provider.
+All six unit tests and all nineteen API tests passed.
+
+Live QR generation has been tested on the local worker/proxy
+implementation. Shared frontend display/scanning, live Incident
+Service verification and final integrated deployment remain pending.
 
 ## Inventory Service Integration
 
@@ -282,9 +439,11 @@ using its reservation ID.
 
 This endpoint supports QR permit verification.
 
-The planned shared frontend will use the reservation
-ID as the QR permit reference. Frontend QR generation
-has not yet been completed.
+The Allocation Service now generates the QR permit image through
+the external QR provider. The QR payload is the reservation ID only.
+The shared frontend will request the image from the authenticated
+Allocation endpoint and support the permit verification workflow.
+Frontend display and scanning have not yet been implemented.
 
 Example valid reservation response:
 
@@ -434,6 +593,7 @@ The Allocation Service owns:
 
 - Parking reservations.
 - Reservation validity rules.
+- QR permit image generation through the external provider.
 - Reservation lookup.
 - Booking periods and reservation states.
 - Automatic allocation.
@@ -442,7 +602,7 @@ The Allocation Service owns:
 
 The Incident Service owns:
 
-- QR permit handling.
+- QR permit verification and incident-side handling.
 - Incident submission.
 - Possible violation detection.
 - Incident investigation and resolution.
@@ -462,11 +622,13 @@ been implemented and individually tested.
 The Allocation Service passed:
 
 - 6 out of 6 unit tests.
-- 15 out of 15 API integration tests.
+- 19 out of 19 API integration tests.
 
 Four new API tests cover reservation lookup
 functionality, input validation, internal
-authentication and conflicting reservation records.
+authentication and conflicting reservation records. Four additional
+API test groups cover QR generation, access control, reservation
+state checks and external provider failure handling.
 
 The API tests use isolated temporary DynamoDB
 tables through Floci.
@@ -579,7 +741,8 @@ The internal reservation validity and lookup
 endpoints use the same INTERNAL_TOKEN.
 
 No legacy JWT signing secret or local password
-database is required.
+database is required. The QR provider does not require an API key.
+Cognito and internal service tokens must not be forwarded to it.
 
 Secret values must not be included in GitHub,
 frontend code, screenshots or application logs.
@@ -606,6 +769,14 @@ The shared frontend will provide:
 
 The frontend will communicate with the backend
 services through the shared routing proxy.
+
+For QR permit display, the frontend must call the protected
+Allocation endpoint using an authenticated `fetch()` request,
+check the response status, read the PNG as a Blob, and display
+it using an object URL. Revoke the object URL when it is no longer
+needed. An ordinary image URL alone cannot attach the required
+Bearer authorization header. Handle errors using the JSON response
+instead of displaying them as images.
 
 Internal service tokens must never be accessible
 to frontend JavaScript.

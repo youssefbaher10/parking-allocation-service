@@ -1,7 +1,7 @@
-
 const { randomUUID, createHash } = require("node:crypto");
 const repo = require("../repositories/dynamodb/requestRepository");
 const { spotsFor } = require("./inventory");
+const { generateQr } = require("./qrProvider");
 const { ApiError, conflict, invalid } = require("./errors");
 
 const {
@@ -384,6 +384,22 @@ async function renew(id, body, actor) {
   });
 }
 
+// Generate a QR parking permit for an authorized reservation.
+async function qrPermit(id, actor) {
+  const reservation = await owned("reservations", id, actor);
+
+  if (
+    reservation.status !== "confirmed" ||
+    reservation.end_time <= now()
+  ) {
+    conflict(
+      "Only confirmed, unexpired reservations can generate QR permits.",
+    );
+  }
+
+  return generateQr(reservation.reservation_id);
+}
+
 // Verify a reservation using its ID.
 // Used for QR permit verification.
 async function validity(id) {
@@ -508,6 +524,7 @@ module.exports = {
   closeRequest,
   cancelReservation,
   renew,
+  qrPermit,
   validity,
   lookupReservation,
   sweep,
