@@ -4,16 +4,16 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "node --test test/rules.test.js",
-    "start": "node index.js",
-    "test:api": "node --test test/api.test.js",
-    "setup": "node scripts/setup.js",
-    "demo": "node scripts/demo.js",
-    "sweep": "node scripts/sweep.js",
-    "walkthrough": "node scripts/walkthrough.js",
-    "cloud:ecs": "node infra/deploy.js",
-    "cloud:schedule": "node infra/maintenance.js"
-  },
+  "test": "node --test test/rules.test.js",
+  "start": "node index.js",
+  "test:api": "node --test test/api.test.js",
+  "setup": "node scripts/setup.js",
+  "demo": "node scripts/demo.js",
+  "sweep": "node scripts/sweep.js",
+  "walkthrough": "node scripts/walkthrough.js",
+  "cloud:ecs": "bash infra/services/10-ecs.sh",
+  "cloud:schedule": "bash infra/services/04-lambda.sh && bash infra/services/05-eventbridge.sh"
+},
   "repository": {
     "type": "git",
     "url": "git+https://github.com/youssefbaher10/parking-allocation-service.git"
@@ -27,6 +27,7 @@
   },
   "homepage": "https://github.com/youssefbaher10/parking-allocation-service#readme",
   "dependencies": {
+    "@aws-sdk/client-cognito-identity-provider": "^3.1178.0",
     "@aws-sdk/client-dynamodb": "^3.1176.0",
     "@aws-sdk/lib-dynamodb": "^3.1176.0",
     "cors": "^2.8.6",

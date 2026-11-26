@@ -1,11 +1,8 @@
-// Uses fresh, uniquely named DynamoDB tables, never the user's existing parking records.
+
 require("dotenv").config({ quiet: true });
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
-const { randomUUID, randomBytes, scryptSync } = require("node:crypto");
-const fs = require("node:fs");
-const os = require("node:os");
-const path = require("node:path");
+const { randomUUID, randomBytes } = require("node:crypto");
 const http = require("node:http");
 const jwt = require("jsonwebtoken");
 const suffix = randomUUID().slice(0, 8);
@@ -14,54 +11,62 @@ const endpoint = new URL(
 );
 if (!["localhost", "127.0.0.1", "[::1]"].includes(endpoint.hostname))
   throw new Error("API tests require a local emulator.");
-const temp = fs.mkdtempSync(path.join(os.tmpdir(), "parking-test-"));
-Object.assign(process.env, {
-  DYNAMODB_ENDPOINT: endpoint.href,
-  AWS_REGION: "us-east-1",
-  AWS_ACCESS_KEY_ID: "test",
-  AWS_SECRET_ACCESS_KEY: "test",
-  AUTH_SECRET: randomBytes(32).toString("hex"),
-  INTERNAL_TOKEN: randomBytes(32).toString("hex"),
-  INVENTORY_MODE: "sample",
-  ACCOUNTS_FILE: path.join(temp, "accounts.json"),
-  RATE_LIMIT: "300",
+// Never send demo credentials to a non-local Cognito endpoint.
+for (const name of ["COGNITO_ENDPOINT", "COGNITO_JWKS_URL"]) {
+  const url = new URL(process.env[name]);
+  if (!['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) ||
+      !['http:', 'https:'].includes(url.protocol)) {
+    throw new Error(name + " must point to the local emulator.");
+  }
+}
+const accounts = [
+  ["student1", "DEMO_USER1_PASSWORD"],
+  ["student2", "DEMO_USER2_PASSWORD"],
+  ["priority1", "DEMO_PRIORITY_PASSWORD"],
+  ["admin1", "DEMO_ADMIN_PASSWORD"],
+];
+for (const [, name] of accounts) {
+  if (!process.env[name]) throw new Error("Set " + name + " before running tests.");
+}
+const testTables = {
   PARKING_REQUESTS_TABLE: "TestRequests" + suffix,
   RESERVATIONS_TABLE: "TestReservations" + suffix,
   WAITLIST_TABLE: "TestWait" + suffix,
   PRICING_TABLE: "TestRules" + suffix,
+};
+Object.assign(process.env, {
+  ...testTables,
+  AUTH_MODE: "cognito",
+  DYNAMODB_ENDPOINT: endpoint.href,
+  AWS_REGION: "us-east-1",
+  AWS_ACCESS_KEY_ID: "test",
+  AWS_SECRET_ACCESS_KEY: "test",
+  INTERNAL_TOKEN: randomBytes(32).toString("hex"),
+  INVENTORY_MODE: "sample",
+  RATE_LIMIT: "300",
 });
 delete process.env.AWS_PROFILE;
-const password = randomBytes(12).toString("hex");
-fs.writeFileSync(
-  process.env.ACCOUNTS_FILE,
-  JSON.stringify([
-    {
-      user_id: "one",
-      role: "user",
-      priority: 1,
-      salt: "test-salt",
-      hash: scryptSync(password, "test-salt", 64).toString("hex"),
-    },
-  ]),
-);
+delete process.env.AWS_SESSION_TOKEN;
+// Cognito does not need a local signing secret or local password file.
+// dotenv may reload these keys, but explicit Cognito mode does not use them.
+delete process.env.AUTH_SECRET;
+delete process.env.ACCOUNTS_FILE;
+delete process.env.ACCOUNTS_JSON;
 const setup = require("../scripts/setup");
 const app = require("../app");
 const db = require("../src/config/dynamodb");
 const tables = require("../src/config/tables");
 const { PutCommand } = require("@aws-sdk/lib-dynamodb");
 const { DeleteTableCommand } = require("@aws-sdk/client-dynamodb");
+// Guard against accidental use or deletion of the application's real tables.
+assert.deepEqual(
+  Object.values(tables).map(t => t.name).sort(),
+  Object.values(testTables).sort(),
+  "Tests must use only the uniquely named temporary tables."
+);
 let server, base;
-function token(sub, role = "user", priority = 1) {
-  return jwt.sign({ sub, role, priority }, process.env.AUTH_SECRET, {
-    expiresIn: "1h",
-    issuer: process.env.AUTH_ISSUER || "parking-team",
-    audience: process.env.AUTH_AUDIENCE || "parking-api",
-  });
-}
-const one = token("one"),
-  two = token("two"),
-  high = token("high", "user", 2),
-  admin = token("admin", "admin");
+let one, two, high, admin;
+let setupStarted = false;
 const start = Date.now() + 86400000;
 function slot(n) {
   return {
@@ -84,49 +89,79 @@ async function api(method, url, actor, body, headers = {}) {
   return { status: res.status, ...(await res.json()) };
 }
 before(async () => {
+  setupStarted = true;
   await setup();
   server = app.listen(0, "127.0.0.1");
   await new Promise((r) => server.once("listening", r));
   base = "http://127.0.0.1:" + server.address().port + "/api/allocation";
+  const tokens = [];
+  for (const [username, passwordVar] of accounts) {
+    const login = await api("POST", "/auth/login", null, {
+      username,
+      password: process.env[passwordVar],
+    });
+    assert.equal(login.status, 200, "Cognito login failed for " + username);
+    assert.equal(typeof login.data?.access_token, "string");
+    const decoded = jwt.decode(login.data.access_token, { complete: true });
+    assert.equal(decoded?.header.alg, "RS256");
+    assert.equal(decoded?.payload.token_use, "access");
+    tokens.push(login.data.access_token);
+  }
+  [one, two, high, admin] = tokens;
 });
 after(async () => {
   if (server) await new Promise((r) => server.close(r));
-  for (const t of Object.values(tables)) {
-    try {
-      await db.send(new DeleteTableCommand({ TableName: t.name }));
-    } catch (e) {
-      if (e.name !== "ResourceNotFoundException") throw e;
+  try {
+    if (setupStarted) {
+      for (const name of Object.values(testTables)) {
+        try {
+          await db.send(new DeleteTableCommand({ TableName: name }));
+        } catch (e) {
+          if (e.name !== "ResourceNotFoundException") throw e;
+        }
+      }
     }
+  } finally {
+    db.destroy();
   }
-  db.destroy();
-  fs.rmSync(temp, { recursive: true, force: true });
 });
-test("missing and expired credentials return 401", async () => {
+test("missing, tampered and expired Cognito credentials return 401", async (t) => {
   assert.equal((await api("GET", "/requests")).status, 401);
-  const expired = jwt.sign(
-    { sub: "one", role: "user", exp: 1 },
-    process.env.AUTH_SECRET,
-  );
-  assert.equal((await api("GET", "/requests", expired)).status, 401);
+  assert.equal((await api("GET", "/requests", one)).status, 200);
+
+  // Modify the payload but leave the original signature unchanged.
+  const parts = one.split(".");
+  const claims = jwt.decode(one);
+  assert.ok(Number.isInteger(claims.exp));
+  parts[1] = Buffer.from(JSON.stringify({
+    ...claims,
+    "cognito:groups": ["admin"],
+  })).toString("base64url");
+  assert.equal((await api("GET", "/requests", parts.join("."))).status, 401);
+
+  // Simulate the clock moving past the expiry of the ORIGINAL signed JWT.
+  // Only this test process is affected; the running app and Floci are unchanged.
+  t.mock.timers.enable({ apis: ["Date"], now: (claims.exp + 1) * 1000 });
+  try {
+    assert.equal((await api("GET", "/requests", one)).status, 401);
+  } finally {
+    t.mock.timers.reset();
+  }
+  assert.equal((await api("GET", "/requests", one)).status, 200);
 });
-test("login succeeds with the password and rejects an incorrect password", async () => {
-  assert.equal(
-    (
-      await api("POST", "/auth/login", null, {
-        username: "one",
-        password: "incorrect",
-      })
-    ).status,
-    401,
-  );
-  const login = await api("POST", "/auth/login", null, {
-    username: "one",
-    password,
+test("Cognito login succeeds with the password and rejects an incorrect password", async () => {
+  const bad = await api("POST", "/auth/login", null, {
+    username: "student1",
+    password: "Wrong!" + randomBytes(16).toString("hex"),
   });
-  assert.equal(
-    (await api("GET", "/requests", login.data.access_token)).status,
-    200,
-  );
+  assert.equal(bad.status, 401);
+  assert.equal(bad.data?.access_token, undefined);
+  const login = await api("POST", "/auth/login", null, {
+    username: "student1",
+    password: process.env.DEMO_USER1_PASSWORD,
+  });
+  assert.equal(login.status, 200);
+  assert.equal((await api("GET", "/requests", login.data.access_token)).status, 200);
 });
 test("role, field validation, media type and malformed JSON", async () => {
   assert.equal((await api("POST", "/admin/maintenance", one)).status, 403);
@@ -197,6 +232,8 @@ test("two simultaneous writes cannot book the same spot; priority wins on releas
     "waitlisted",
   ]);
   const premium = await api("POST", "/requests", high, body);
+  assert.equal(premium.status, 201);
+  assert.equal(premium.data.priority, 2);
   assert.equal((await api("GET", "/waitlist/me", high)).data[0].queue_rank, 1);
   const active = persisted.find((r) => r.data.status === "allocated").data;
   assert.equal(
