@@ -5,7 +5,14 @@ const auth = require("../middleware/auth");
 
 const router = express.Router();
 
-// Internal service authentication
+// Internal reservation lookup for incident reports
+router.get(
+  "/internal/reservations/lookup",
+  auth.internal,
+  c.lookupReservation
+);
+
+// Internal reservation validity for QR permit verification
 router.get(
   "/internal/reservations/:id/validity",
   auth.internal,

@@ -1,4 +1,3 @@
-
 require("dotenv").config({ quiet: true });
 const { test, before, after } = require("node:test");
 const assert = require("node:assert/strict");
@@ -426,6 +425,130 @@ test("admin assigns a matching spot after Inventory activates it", async () => {
     await new Promise((r) => catalogue.close(r));
   }
 });
+// Reservation lookup tests use only the temporary test tables.
+function lookupPath(plate, spot) {
+  return "/internal/reservations/lookup?" + new URLSearchParams({
+    vehicle_plate: plate,
+    spot_id: spot,
+  }).toString();
+}
+
+async function seedLookupReservation(overrides = {}) {
+  const item = {
+    reservation_id: "res_lookup_" + randomUUID(),
+    vehicle_plate: "LOOKUP123",
+    spot_id: "LOOKUP-A1",
+    status: "confirmed",
+    start_time: new Date(Date.now() - 60000).toISOString(),
+    end_time: new Date(Date.now() + 3600000).toISOString(),
+    ...overrides,
+  };
+  await db.send(new PutCommand({
+    TableName: tables.reservations.name,
+    Item: item,
+  }));
+  return item;
+}
+
+test("reservation lookup matches active plate and spot and rejects inactive periods", async () => {
+  const token = process.env.INTERNAL_TOKEN;
+  const active = await seedLookupReservation();
+  const arabic = await seedLookupReservation({
+    vehicle_plate: "أ ب ج 123",
+    spot_id: "LOOKUP-AR",
+  });
+  await seedLookupReservation({
+    spot_id: "LOOKUP-FUTURE",
+    start_time: new Date(Date.now() + 3600000).toISOString(),
+    end_time: new Date(Date.now() + 7200000).toISOString(),
+  });
+  await seedLookupReservation({
+    spot_id: "LOOKUP-PAST",
+    start_time: new Date(Date.now() - 7200000).toISOString(),
+    end_time: new Date(Date.now() - 3600000).toISOString(),
+  });
+  await seedLookupReservation({
+    spot_id: "LOOKUP-CANCELLED",
+    status: "cancelled",
+  });
+  await seedLookupReservation({
+    spot_id: "LOOKUP-EXPIRED",
+    status: "expired",
+    start_time: new Date(Date.now() - 7200000).toISOString(),
+    end_time: new Date(Date.now() - 3600000).toISOString(),
+  });
+
+  for (const [plate, expected] of [[" lookup123 ", active], [arabic.vehicle_plate, arabic]]) {
+    const result = await api("GET", lookupPath(plate, expected.spot_id), token);
+    assert.equal(result.status, 200);
+    assert.equal(result.success, true);
+    assert.deepEqual(result.data, {
+      valid: true,
+      reservation_id: expected.reservation_id,
+      spot_id: expected.spot_id,
+      vehicle_plate: expected.vehicle_plate,
+    });
+  }
+
+  for (const [plate, spot] of [
+    ["WRONG123", active.spot_id],
+    [active.vehicle_plate, "LOOKUP-NONE"],
+    [active.vehicle_plate, "LOOKUP-FUTURE"],
+    [active.vehicle_plate, "LOOKUP-PAST"],
+    [active.vehicle_plate, "LOOKUP-CANCELLED"],
+    [active.vehicle_plate, "LOOKUP-EXPIRED"],
+  ]) {
+    const result = await api("GET", lookupPath(plate, spot), token);
+    assert.equal(result.status, 200);
+    assert.equal(result.success, true);
+    assert.deepEqual(result.data, {
+      valid: false,
+      reservation_id: null,
+      spot_id: null,
+      vehicle_plate: null,
+    });
+  }
+});
+
+test("reservation lookup requires the internal token, not a user or admin token", async () => {
+  const url = lookupPath("LOOKUP123", "LOOKUP-A1");
+  for (const token of [undefined, randomBytes(32).toString("hex"), one, admin]) {
+    const result = await api("GET", url, token);
+    assert.equal(result.status, 401);
+    assert.equal(result.data, undefined);
+  }
+});
+
+test("reservation lookup rejects missing, malformed and unexpected query parameters", async () => {
+  const path = "/internal/reservations/lookup";
+  const token = process.env.INTERNAL_TOKEN;
+  for (const url of [
+    path,
+    path + "?spot_id=LOOKUP-A1",
+    path + "?vehicle_plate=LOOKUP123",
+    lookupPath("@@@", "LOOKUP-A1"),
+    lookupPath("LOOKUP123", "bad/spot"),
+    lookupPath("LOOKUP123", "LOOKUP-A1") + "&vehicle_plate=OTHER",
+    lookupPath("LOOKUP123", "LOOKUP-A1") + "&unexpected=true",
+  ]) {
+    const result = await api("GET", url, token);
+    assert.equal(result.status, 400, url);
+  }
+});
+
+test("reservation lookup reports conflicting active records as an error", async () => {
+  const fixture = { vehicle_plate: "CONFLICT123", spot_id: "LOOKUP-CONFLICT" };
+  await seedLookupReservation(fixture);
+  await seedLookupReservation(fixture);
+  const result = await api(
+    "GET",
+    lookupPath(fixture.vehicle_plate, fixture.spot_id),
+    process.env.INTERNAL_TOKEN,
+  );
+  assert.equal(result.status, 503);
+  assert.equal(result.data, undefined);
+});
+
 test("security headers and rate limit", async () => {
   const res = await fetch(base + "/requests", {
     headers: { Authorization: "Bearer " + one },
